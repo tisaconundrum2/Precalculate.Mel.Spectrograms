@@ -10,6 +10,5 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
     <PackageReference Include="ParquetSharp" Version="25.0.1.2" />
-    <PackageReference Include="TorchSharp-cpu" Version="0.107.0" />
   </ItemGroup>
 </Project>

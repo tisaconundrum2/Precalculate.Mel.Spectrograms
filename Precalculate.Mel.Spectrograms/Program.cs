@@ -14,10 +14,22 @@ builder.Services.Configure<RecipeOptions>(
 
 builder.Services.AddSingleton<IMelSource, HuggingFaceMelSource>();
 
-// Default to local filesystem publisher. Replace with a Hub publisher for HF jobs.
-var outputDir = builder.Configuration["Shard:OutputDirectory"] ?? "output";
-builder.Services.AddSingleton<IShardPublisher>(
-    new DirectoryShardPublisher(outputDir));
+// Use HF Hub publisher if HF_TOKEN and repo are configured, otherwise local filesystem
+var hfToken = Environment.GetEnvironmentVariable("HF_TOKEN");
+var hubRepo = builder.Configuration["Shard:HubRepo"];
+if (!string.IsNullOrEmpty(hfToken) && !string.IsNullOrEmpty(hubRepo))
+{
+    var hubPrefix = builder.Configuration["Shard:HubPrefix"] ?? "";
+    builder.Services.AddSingleton<IShardPublisher>(sp =>
+        new HubShardPublisher(hubRepo, hubPrefix, hfToken,
+            sp.GetRequiredService<ILogger<HubShardPublisher>>()));
+}
+else
+{
+    var outputDir = builder.Configuration["Shard:OutputDirectory"] ?? "output";
+    builder.Services.AddSingleton<IShardPublisher>(
+        new DirectoryShardPublisher(outputDir));
+}
 
 builder.Services.AddHostedService<MelShardWorker>();
 

@@ -24,10 +24,8 @@ public sealed class HuggingFaceMelSource : IMelSource
     private readonly IOptions<MountOptions> _mountOptions;
     private readonly IOptions<RecipeOptions> _recipeOptions;
     private readonly ILogger<HuggingFaceMelSource> _log;
-    private readonly GpuMelTransform? _gpuMel;
-    private readonly MelTransform _cpuMel = new();
+    private readonly MelTransform _mel = new();
     private readonly CharTokenizer _tokenizer = new();
-    private readonly bool _useGpu;
 
     public HuggingFaceMelSource(
         IOptions<MountOptions> mountOptions,
@@ -37,27 +35,12 @@ public sealed class HuggingFaceMelSource : IMelSource
         _mountOptions = mountOptions;
         _recipeOptions = recipeOptions;
         _log = log;
-
-        try
-        {
-            _gpuMel = new GpuMelTransform();
-            _useGpu = true;
-            _log.LogInformation("Using {Device} for mel spectrograms",
-                _gpuMel.IsGpu ? "CUDA GPU" : "CPU (via TorchSharp)");
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "TorchSharp unavailable, using pure C# mel transform");
-            _useGpu = false;
-        }
     }
 
-    private int MelBins => _useGpu ? _gpuMel!.MelBins : _cpuMel.MelBins;
+    private int MelBins => _mel.MelBins;
 
     private (float[] Values, int Frames)[] ComputeMelBatch(float[][] clips)
-        => _useGpu
-            ? _gpuMel!.ComputeBatch(clips)
-            : clips.Select(c => _cpuMel.Compute(c)).ToArray();
+        => clips.Select(c => _mel.Compute(c)).ToArray();
 
     public async IAsyncEnumerable<MelSample> ReadAsync(
         [EnumeratorCancellation] CancellationToken ct)
@@ -158,6 +141,8 @@ public sealed class HuggingFaceMelSource : IMelSource
         int globalIndex = startIndex;
         using var reader = new ParquetFileReader(path);
         var samples = new List<MelSample>();
+        int decoded = 0, skipped = 0;
+        var fileStart = System.Diagnostics.Stopwatch.StartNew();
 
         for (int rg = 0; rg < reader.FileMetaData.NumRowGroups; rg++)
         {
@@ -184,15 +169,17 @@ public sealed class HuggingFaceMelSource : IMelSource
             // Read audio bytes column (struct with "bytes" field)
             var audioBytes = ReadAudioBytesColumn(rowGroup, audioColIdx, numRows);
 
-            // Collect decoded audio + metadata in batches for GPU mel processing
+            // Collect decoded audio + metadata in batches for mel processing
             var pending = new List<(float[] Pcm, string Text, int[] TokenIds)>();
 
             void FlushBatch()
             {
                 if (pending.Count == 0) return;
 
+                var batchStart = System.Diagnostics.Stopwatch.StartNew();
                 var pcmBatch = pending.Select(p => p.Pcm).ToArray();
                 var melResults = ComputeMelBatch(pcmBatch);
+                batchStart.Stop();
 
                 for (int b = 0; b < pending.Count; b++)
                 {
@@ -208,6 +195,9 @@ public sealed class HuggingFaceMelSource : IMelSource
                         TokenIds: pending[b].TokenIds));
                     globalIndex++;
                 }
+
+                _log.LogDebug("    Batch: {Count} clips, mel in {Ms}ms",
+                    pending.Count, batchStart.ElapsedMilliseconds);
                 pending.Clear();
             }
 
@@ -220,35 +210,64 @@ public sealed class HuggingFaceMelSource : IMelSource
                 byte[]? audio = audioBytes[row];
 
                 if (string.IsNullOrWhiteSpace(text) || audio is null || audio.Length == 0)
+                {
+                    skipped++;
                     continue;
+                }
 
                 string normalized = CharTokenizer.Normalize(text);
                 int[] tokenIds = _tokenizer.Encode(normalized);
                 if (tokenIds.Length == 0)
+                {
+                    skipped++;
                     continue;
+                }
 
                 float[]? pcm;
                 try
                 {
                     pcm = DecodeAudio(audio);
+                    decoded++;
                 }
                 catch
                 {
+                    skipped++;
                     continue;
                 }
 
                 if (pcm is null || pcm.Length < MinAudioSamples || pcm.Length > MaxAudioSamples)
+                {
+                    skipped++;
                     continue;
+                }
 
                 pending.Add((pcm, normalized, tokenIds));
 
                 if (pending.Count >= BatchSize)
                     FlushBatch();
+
+                // Progress every 100 rows
+                if ((row + 1) % 100 == 0)
+                {
+                    double pct = 100.0 * (row + 1) / numRows;
+                    double elapsed = fileStart.Elapsed.TotalSeconds;
+                    double rate = decoded / Math.Max(elapsed, 0.1);
+                    _log.LogInformation("    {File}: row {Row}/{Total} ({Pct:F0}%), " +
+                        "{Decoded} decoded, {Skipped} skipped, {Rate:F0} samples/s",
+                        Path.GetFileName(path), row + 1, numRows, pct,
+                        decoded, skipped, rate);
+                }
             }
 
             // Flush remaining partial batch
             FlushBatch();
         }
+
+        fileStart.Stop();
+        _log.LogInformation("  Finished {File}: {Samples} samples in {Secs:F1}s " +
+            "({Decoded} decoded, {Skipped} skipped)",
+            Path.GetFileName(path), samples.Count, fileStart.Elapsed.TotalSeconds,
+            decoded, skipped);
 
         return samples.ToArray();
     }
