@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using TorchSharp;
 using static TorchSharp.torch;
 
@@ -10,6 +11,8 @@ namespace Precalculate.Mel.Spectrograms.Services;
 /// </summary>
 public sealed class GpuMelTransform : IDisposable
 {
+    private static bool _nativeLoaded;
+
     private readonly int _nFft;
     private readonly int _hopLength;
     private readonly int _nMels;
@@ -21,12 +24,41 @@ public sealed class GpuMelTransform : IDisposable
     public int MelBins => _nMels;
     public bool IsGpu => _device.type == DeviceType.CUDA;
 
+    /// <summary>
+    /// Explicitly load libtorch from /opt/libtorch if available (Docker with CUDA).
+    /// TorchSharp doesn't auto-discover from LD_LIBRARY_PATH.
+    /// </summary>
+    private static void EnsureNativeLoaded()
+    {
+        if (_nativeLoaded) return;
+
+        string libtorchPath = "/opt/libtorch/lib";
+        if (Directory.Exists(libtorchPath))
+        {
+            // Load libtorch native libraries explicitly
+            NativeLibrary.Load(Path.Combine(libtorchPath, "libtorch.so"));
+            NativeLibrary.Load(Path.Combine(libtorchPath, "libtorch_cpu.so"));
+
+            // Try CUDA backend
+            string cudaLib = Path.Combine(libtorchPath, "libtorch_cuda.so");
+            if (File.Exists(cudaLib))
+            {
+                NativeLibrary.Load(cudaLib);
+                torch.InitializeDeviceType(DeviceType.CUDA);
+            }
+        }
+
+        _nativeLoaded = true;
+    }
+
     public GpuMelTransform(
         int sampleRate = 16_000,
         int nFft = 400,
         int hopLength = 160,
         int nMels = 80)
     {
+        EnsureNativeLoaded();
+
         _sampleRate = sampleRate;
         _nFft = nFft;
         _hopLength = hopLength;
