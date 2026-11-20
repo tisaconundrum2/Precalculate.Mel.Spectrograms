@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Precalculate.Mel.Spectrograms.Contracts;
 using Precalculate.Mel.Spectrograms.Models;
 using Precalculate.Mel.Spectrograms.Services;
@@ -9,8 +10,26 @@ builder.Services.Configure<ShardOptions>(
     builder.Configuration.GetSection(ShardOptions.SectionName));
 builder.Services.Configure<MountOptions>(
     builder.Configuration.GetSection(MountOptions.SectionName));
-builder.Services.Configure<RecipeOptions>(
-    builder.Configuration.GetSection(RecipeOptions.SectionName));
+
+// If RECIPE_NAME is set, use the named recipe from the Recipes dictionary
+var recipeName = Environment.GetEnvironmentVariable("RECIPE_NAME");
+if (!string.IsNullOrEmpty(recipeName))
+{
+    builder.Services.Configure<RecipeOptions>(
+        builder.Configuration.GetSection($"Recipes:{recipeName}"));
+
+    // Override shard hub prefix if the recipe specifies one
+    var hubPrefixOverride = builder.Configuration[$"Recipes:{recipeName}:HubPrefix"];
+    if (!string.IsNullOrEmpty(hubPrefixOverride))
+    {
+        builder.Services.PostConfigure<ShardOptions>(o => o.HubPrefix = hubPrefixOverride);
+    }
+}
+else
+{
+    builder.Services.Configure<RecipeOptions>(
+        builder.Configuration.GetSection(RecipeOptions.SectionName));
+}
 
 builder.Services.AddSingleton<IMelSource, HuggingFaceMelSource>();
 
@@ -19,10 +38,12 @@ var hfToken = Environment.GetEnvironmentVariable("HF_TOKEN");
 var hubRepo = builder.Configuration["Shard:HubRepo"];
 if (!string.IsNullOrEmpty(hfToken) && !string.IsNullOrEmpty(hubRepo))
 {
-    var hubPrefix = builder.Configuration["Shard:HubPrefix"] ?? "";
     builder.Services.AddSingleton<IShardPublisher>(sp =>
-        new HubShardPublisher(hubRepo, hubPrefix, hfToken,
-            sp.GetRequiredService<ILogger<HubShardPublisher>>()));
+    {
+        var opts = sp.GetRequiredService<IOptions<ShardOptions>>().Value;
+        return new HubShardPublisher(hubRepo, opts.HubPrefix ?? "", hfToken,
+            sp.GetRequiredService<ILogger<HubShardPublisher>>());
+    });
 }
 else
 {

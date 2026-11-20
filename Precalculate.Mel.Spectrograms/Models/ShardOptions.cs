@@ -8,5 +8,5 @@ public sealed class ShardOptions
     public int SamplesPerShard { get; init; } = 5_000;
     public long MaxMelBytes { get; init; } = 2_000_000_000;
     public string? HubRepo { get; init; }
-    public string? HubPrefix { get; init; }
+    public string? HubPrefix { get; set; }
 }
