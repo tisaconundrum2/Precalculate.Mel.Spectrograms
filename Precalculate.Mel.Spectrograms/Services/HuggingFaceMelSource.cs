@@ -316,13 +316,13 @@ public sealed class HuggingFaceMelSource(
 
     /// <summary>
     /// Find a column index in the flattened parquet schema.
-    /// HF Audio columns are stored as structs: audio → audio.bytes + audio.path.
-    /// We search for exact match first, then "{name}.bytes" for nested audio structs,
-    /// then any column whose path contains the name.
+    /// HF datasets have varying layouts:
+    ///   - Nested struct: audio.bytes, audio.path (VoxPopuli, People's Speech)
+    ///   - Flattened: bytes, path (LibriSpeech)
+    /// For "audio" we try: audio → audio.bytes → bytes (fallback for flattened schemas).
     /// </summary>
     private int FindColumnIndex(SchemaDescriptor schema, string name)
     {
-        // Collect all column names for diagnostics
         var colNames = new string[schema.NumColumns];
         for (int i = 0; i < schema.NumColumns; i++)
             colNames[i] = schema.Column(i).Name;
@@ -334,15 +334,26 @@ public sealed class HuggingFaceMelSource(
                 return i;
         }
 
-        // HF Audio struct: look for "{name}.bytes"
-        string bytesName = $"{name}.bytes";
+        // HF Audio struct nested: "{name}.bytes"
+        string bytesNested = $"{name}.bytes";
         for (int i = 0; i < schema.NumColumns; i++)
         {
-            if (colNames[i].Equals(bytesName, StringComparison.OrdinalIgnoreCase))
+            if (colNames[i].Equals(bytesNested, StringComparison.OrdinalIgnoreCase))
                 return i;
         }
 
-        // Partial match: column path contains the name (e.g. "audio.bytes" contains "audio")
+        // HF Audio flattened: the struct is exploded to top-level "bytes" column
+        // This happens when looking for "audio" but the schema has "bytes" directly
+        if (name.Equals("audio", StringComparison.OrdinalIgnoreCase))
+        {
+            for (int i = 0; i < schema.NumColumns; i++)
+            {
+                if (colNames[i].Equals("bytes", StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+        }
+
+        // Partial match: column path contains the name
         for (int i = 0; i < schema.NumColumns; i++)
         {
             if (colNames[i].Contains(name, StringComparison.OrdinalIgnoreCase))
