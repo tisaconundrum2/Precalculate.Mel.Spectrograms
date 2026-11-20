@@ -32,19 +32,20 @@ public sealed class GpuMelTransform : IDisposable
     {
         if (_nativeLoaded) return;
 
+        // If /opt/libtorch exists (Docker with CUDA), tell TorchSharp to use it
+        // by initializing CUDA device type. The TorchSharp-cpu NuGet provides
+        // LibTorchSharp.so (the C# interop shim), and /opt/libtorch/lib provides
+        // the actual libtorch + CUDA libraries via LD_LIBRARY_PATH.
         string libtorchPath = "/opt/libtorch/lib";
         if (Directory.Exists(libtorchPath))
         {
-            // Load libtorch native libraries explicitly
-            NativeLibrary.Load(Path.Combine(libtorchPath, "libtorch.so"));
-            NativeLibrary.Load(Path.Combine(libtorchPath, "libtorch_cpu.so"));
-
-            // Try CUDA backend
-            string cudaLib = Path.Combine(libtorchPath, "libtorch_cuda.so");
-            if (File.Exists(cudaLib))
+            try
             {
-                NativeLibrary.Load(cudaLib);
                 torch.InitializeDeviceType(DeviceType.CUDA);
+            }
+            catch
+            {
+                // CUDA init failed, fall back to CPU (already loaded via TorchSharp-cpu)
             }
         }
 
