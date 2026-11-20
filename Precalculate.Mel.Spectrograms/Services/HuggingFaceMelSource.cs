@@ -110,6 +110,16 @@ public sealed class HuggingFaceMelSource(
             using var rowGroup = reader.RowGroup(rg);
             int numRows = checked((int)rowGroup.MetaData.NumRows);
 
+            // Log schema once per file for debugging
+            if (rg == 0)
+            {
+                var schema = reader.FileMetaData.Schema;
+                var cols = new string[schema.NumColumns];
+                for (int c = 0; c < schema.NumColumns; c++)
+                    cols[c] = schema.Column(c).Name;
+                log.LogDebug("Schema for {Path}: [{Columns}]", path, string.Join(", ", cols));
+            }
+
             // Find column indices
             int audioColIdx = FindColumnIndex(reader.FileMetaData.Schema, audioCol);
             int textColIdx = FindColumnIndex(reader.FileMetaData.Schema, textCol);
@@ -304,13 +314,43 @@ public sealed class HuggingFaceMelSource(
         return files;
     }
 
-    private static int FindColumnIndex(SchemaDescriptor schema, string name)
+    /// <summary>
+    /// Find a column index in the flattened parquet schema.
+    /// HF Audio columns are stored as structs: audio → audio.bytes + audio.path.
+    /// We search for exact match first, then "{name}.bytes" for nested audio structs,
+    /// then any column whose path contains the name.
+    /// </summary>
+    private int FindColumnIndex(SchemaDescriptor schema, string name)
     {
+        // Collect all column names for diagnostics
+        var colNames = new string[schema.NumColumns];
+        for (int i = 0; i < schema.NumColumns; i++)
+            colNames[i] = schema.Column(i).Name;
+
+        // Exact match
         for (int i = 0; i < schema.NumColumns; i++)
         {
-            if (schema.Column(i).Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            if (colNames[i].Equals(name, StringComparison.OrdinalIgnoreCase))
                 return i;
         }
+
+        // HF Audio struct: look for "{name}.bytes"
+        string bytesName = $"{name}.bytes";
+        for (int i = 0; i < schema.NumColumns; i++)
+        {
+            if (colNames[i].Equals(bytesName, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        // Partial match: column path contains the name (e.g. "audio.bytes" contains "audio")
+        for (int i = 0; i < schema.NumColumns; i++)
+        {
+            if (colNames[i].Contains(name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        log.LogError("Column '{Name}' not found. Schema columns: [{Columns}]",
+            name, string.Join(", ", colNames));
         throw new InvalidDataException($"Column '{name}' not found in parquet schema.");
     }
 
