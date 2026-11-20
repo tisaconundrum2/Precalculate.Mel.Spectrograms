@@ -39,6 +39,6 @@ jobs:
           file: Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/grassmann:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/grassmann-mel-cache:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
