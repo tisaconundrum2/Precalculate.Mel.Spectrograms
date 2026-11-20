@@ -95,17 +95,36 @@ public sealed class HuggingFaceMelSource : IMelSource
                 ct.ThrowIfCancellationRequested();
 
                 MelSample[] batch;
-                try
+                const int maxRetries = 3;
+                bool success = false;
+                batch = [];
+
+                for (int attempt = 1; attempt <= maxRetries; attempt++)
                 {
-                    batch = ReadParquetFile(path, audioCol, textCol,
-                        source.MaxSamples.HasValue ? source.MaxSamples.Value - sourceCount : null,
-                        globalIndex);
+                    try
+                    {
+                        batch = ReadParquetFile(path, audioCol, textCol,
+                            source.MaxSamples.HasValue ? source.MaxSamples.Value - sourceCount : null,
+                            globalIndex);
+                        success = true;
+                        break;
+                    }
+                    catch (Exception ex) when (attempt < maxRetries)
+                    {
+                        _log.LogWarning(ex,
+                            "Failed to read {Path} (attempt {Attempt}/{Max}), retrying in {Delay}s",
+                            path, attempt, maxRetries, attempt * 5);
+                        await Task.Delay(attempt * 5000, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex,
+                            "Failed to read {Path} after {Max} attempts, skipping",
+                            path, maxRetries);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Failed to read {Path}, skipping", path);
-                    continue;
-                }
+
+                if (!success) continue;
 
                 foreach (var sample in batch)
                 {
