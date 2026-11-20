@@ -8,6 +8,8 @@ RUN dotnet restore Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.c
 COPY Precalculate.Mel.Spectrograms/ Precalculate.Mel.Spectrograms/
 RUN dotnet publish Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.csproj \
     -c Release \
+    -r linux-x64 \
+    --self-contained false \
     -o /app \
     --no-restore
 

@@ -14,29 +14,58 @@ namespace Precalculate.Mel.Spectrograms.Services;
 /// /data/{org}/{repo}/{config}/{split}/0000.parquet, etc.
 /// Audio is stored as a struct column { "bytes": byte[], "path": string }.
 /// </summary>
-public sealed class HuggingFaceMelSource(
-    IOptions<MountOptions> mountOptions,
-    IOptions<RecipeOptions> recipeOptions,
-    ILogger<HuggingFaceMelSource> log) : IMelSource
+public sealed class HuggingFaceMelSource : IMelSource
 {
     private const int TargetSampleRate = 16_000;
     private const int MinAudioSamples = 1_600;   // ~0.1s at 16kHz
     private const int MaxAudioSamples = 240_000;  // ~15s at 16kHz
+    private const int BatchSize = 64;
 
-    private const int BatchSize = 64; // Audio clips to decode before GPU mel batch
-
-    private readonly GpuMelTransform _mel = new();
+    private readonly IOptions<MountOptions> _mountOptions;
+    private readonly IOptions<RecipeOptions> _recipeOptions;
+    private readonly ILogger<HuggingFaceMelSource> _log;
+    private readonly GpuMelTransform? _gpuMel;
+    private readonly MelTransform _cpuMel = new();
     private readonly CharTokenizer _tokenizer = new();
+    private readonly bool _useGpu;
+
+    public HuggingFaceMelSource(
+        IOptions<MountOptions> mountOptions,
+        IOptions<RecipeOptions> recipeOptions,
+        ILogger<HuggingFaceMelSource> log)
+    {
+        _mountOptions = mountOptions;
+        _recipeOptions = recipeOptions;
+        _log = log;
+
+        try
+        {
+            _gpuMel = new GpuMelTransform();
+            _useGpu = true;
+            _log.LogInformation("Using {Device} for mel spectrograms",
+                _gpuMel.IsGpu ? "CUDA GPU" : "CPU (via TorchSharp)");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "TorchSharp unavailable, using pure C# mel transform");
+            _useGpu = false;
+        }
+    }
+
+    private int MelBins => _useGpu ? _gpuMel!.MelBins : _cpuMel.MelBins;
+
+    private (float[] Values, int Frames)[] ComputeMelBatch(float[][] clips)
+        => _useGpu
+            ? _gpuMel!.ComputeBatch(clips)
+            : clips.Select(c => _cpuMel.Compute(c)).ToArray();
 
     public async IAsyncEnumerable<MelSample> ReadAsync(
         [EnumeratorCancellation] CancellationToken ct)
     {
-        var mounts = mountOptions.Value;
-        var recipe = recipeOptions.Value;
+        var mounts = _mountOptions.Value;
+        var recipe = _recipeOptions.Value;
 
-        log.LogInformation("Using {Device} for mel spectrograms",
-            _mel.IsGpu ? "CUDA GPU" : "CPU");
-        log.LogInformation("Processing recipe '{Name}' with {Count} sources",
+        _log.LogInformation("Processing recipe '{Name}' with {Count} sources",
             recipe.Name, recipe.Sources.Count);
 
         int globalIndex = 0;
@@ -51,12 +80,12 @@ public sealed class HuggingFaceMelSource(
             var parquetFiles = FindParquetFiles(mounts, source);
             if (parquetFiles.Count == 0)
             {
-                log.LogWarning("No parquet files found for {Source}/{Split}",
+                _log.LogWarning("No parquet files found for {Source}/{Split}",
                     source.Name, source.Split);
                 continue;
             }
 
-            log.LogInformation("Reading {Source}/{Split}: {Files} parquet files, " +
+            _log.LogInformation("Reading {Source}/{Split}: {Files} parquet files, " +
                 "audio='{Audio}', text='{Text}'",
                 source.Name, source.Split, parquetFiles.Count, audioCol, textCol);
 
@@ -74,7 +103,7 @@ public sealed class HuggingFaceMelSource(
                 }
                 catch (Exception ex)
                 {
-                    log.LogWarning(ex, "Failed to read {Path}, skipping", path);
+                    _log.LogWarning(ex, "Failed to read {Path}, skipping", path);
                     continue;
                 }
 
@@ -85,7 +114,7 @@ public sealed class HuggingFaceMelSource(
                     globalIndex++;
 
                     if (sourceCount % 1000 == 0)
-                        log.LogInformation("    {Source}: {Count} samples processed ({Total} total)",
+                        _log.LogInformation("    {Source}: {Count} samples processed ({Total} total)",
                             source.Name, sourceCount, globalIndex);
                 }
 
@@ -93,13 +122,13 @@ public sealed class HuggingFaceMelSource(
                     break;
             }
 
-            log.LogInformation("  {Source}/{Split}: {Count} samples",
+            _log.LogInformation("  {Source}/{Split}: {Count} samples",
                 source.Name, source.Split, sourceCount);
 
             await Task.CompletedTask; // Keep async signature; yields are the real work
         }
 
-        log.LogInformation("Recipe '{Name}' complete: {Total} total samples",
+        _log.LogInformation("Recipe '{Name}' complete: {Total} total samples",
             recipe.Name, globalIndex);
     }
 
@@ -123,7 +152,7 @@ public sealed class HuggingFaceMelSource(
                 var cols = new string[schema.NumColumns];
                 for (int c = 0; c < schema.NumColumns; c++)
                     cols[c] = schema.Column(c).Name;
-                log.LogDebug("Schema for {Path}: [{Columns}]", path, string.Join(", ", cols));
+                _log.LogDebug("Schema for {Path}: [{Columns}]", path, string.Join(", ", cols));
             }
 
             // Find column indices
@@ -144,7 +173,7 @@ public sealed class HuggingFaceMelSource(
                 if (pending.Count == 0) return;
 
                 var pcmBatch = pending.Select(p => p.Pcm).ToArray();
-                var melResults = _mel.ComputeBatch(pcmBatch);
+                var melResults = ComputeMelBatch(pcmBatch);
 
                 for (int b = 0; b < pending.Count; b++)
                 {
@@ -154,7 +183,7 @@ public sealed class HuggingFaceMelSource(
                     string sampleId = $"{globalIndex:D8}";
                     samples.Add(new MelSample(
                         Id: sampleId,
-                        MelBins: _mel.MelBins,
+                        MelBins: MelBins,
                         Frames: frames,
                         Values: values,
                         TokenIds: pending[b].TokenIds));
@@ -278,12 +307,12 @@ public sealed class HuggingFaceMelSource(
             var topLevel = Directory.GetDirectories(mountPath)
                 .Select(Path.GetFileName)
                 .Take(10);
-            log.LogInformation("  Mount {Path} contains dirs: [{Dirs}]",
+            _log.LogInformation("  Mount {Path} contains dirs: [{Dirs}]",
                 mountPath, string.Join(", ", topLevel));
         }
         else
         {
-            log.LogWarning("  Mount path does not exist: {Path}", mountPath);
+            _log.LogWarning("  Mount path does not exist: {Path}", mountPath);
             return [];
         }
 
@@ -333,7 +362,7 @@ public sealed class HuggingFaceMelSource(
 
             if (candidates.Count > 0)
             {
-                log.LogInformation("  Found {Count} parquet files in {Dir}",
+                _log.LogInformation("  Found {Count} parquet files in {Dir}",
                     candidates.Count, dir);
                 files.AddRange(candidates);
                 break;
@@ -389,7 +418,7 @@ public sealed class HuggingFaceMelSource(
                 return i;
         }
 
-        log.LogError("Column '{Name}' not found. Schema columns: [{Columns}]",
+        _log.LogError("Column '{Name}' not found. Schema columns: [{Columns}]",
             name, string.Join(", ", colNames));
         throw new InvalidDataException($"Column '{name}' not found in parquet schema.");
     }
