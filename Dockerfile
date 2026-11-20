@@ -14,6 +14,9 @@ RUN dotnet publish Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.c
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # HF Jobs mount datasets at /data; spool is ephemeral
 RUN mkdir -p /tmp/mel-spool /data
 
