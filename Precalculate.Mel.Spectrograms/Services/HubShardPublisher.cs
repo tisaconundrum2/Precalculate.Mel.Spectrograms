@@ -80,12 +80,17 @@ public sealed class HubShardPublisher : IShardPublisher
         // huggingface-cli upload <repo_id> <local_path> <path_in_repo> --repo-type dataset
         var psi = new ProcessStartInfo
         {
-            FileName = "huggingface-cli",
+            FileName = "python3",
             ArgumentList =
             {
-                "upload", _repoId, localPath, pathInRepo,
-                "--repo-type", "dataset",
-                "--commit-message", $"Add {Path.GetFileName(localPath)}"
+                "-c",
+                $"from huggingface_hub import HfApi; " +
+                $"HfApi().upload_file(" +
+                $"path_or_fileobj='{localPath}', " +
+                $"path_in_repo='{pathInRepo}', " +
+                $"repo_id='{_repoId}', " +
+                $"repo_type='dataset', " +
+                $"commit_message='Add {Path.GetFileName(localPath)}')"
             },
             RedirectStandardOutput = true,
             RedirectStandardError = true,
