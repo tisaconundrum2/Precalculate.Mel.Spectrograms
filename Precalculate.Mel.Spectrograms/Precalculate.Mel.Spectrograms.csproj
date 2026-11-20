@@ -10,5 +10,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
     <PackageReference Include="ParquetSharp" Version="25.0.1.2" />
+    <PackageReference Include="TorchSharp" Version="0.107.0" />
+    <PackageReference Include="libtorch-cuda-12.1-linux-x64" Version="2.5.1.2" Condition="'$(BuildingInsideDocker)' == 'true'" />
   </ItemGroup>
 </Project>

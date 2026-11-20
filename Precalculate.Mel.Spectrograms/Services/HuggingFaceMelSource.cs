@@ -23,7 +23,9 @@ public sealed class HuggingFaceMelSource(
     private const int MinAudioSamples = 1_600;   // ~0.1s at 16kHz
     private const int MaxAudioSamples = 240_000;  // ~15s at 16kHz
 
-    private readonly MelTransform _mel = new();
+    private const int BatchSize = 64; // Audio clips to decode before GPU mel batch
+
+    private readonly GpuMelTransform _mel = new();
     private readonly CharTokenizer _tokenizer = new();
 
     public async IAsyncEnumerable<MelSample> ReadAsync(
@@ -32,6 +34,8 @@ public sealed class HuggingFaceMelSource(
         var mounts = mountOptions.Value;
         var recipe = recipeOptions.Value;
 
+        log.LogInformation("Using {Device} for mel spectrograms",
+            _mel.IsGpu ? "CUDA GPU" : "CPU");
         log.LogInformation("Processing recipe '{Name}' with {Count} sources",
             recipe.Name, recipe.Sources.Count);
 
@@ -66,7 +70,7 @@ public sealed class HuggingFaceMelSource(
                 {
                     batch = ReadParquetFile(path, audioCol, textCol,
                         source.MaxSamples.HasValue ? source.MaxSamples.Value - sourceCount : null,
-                        ref globalIndex);
+                        globalIndex);
                 }
                 catch (Exception ex)
                 {
@@ -78,6 +82,7 @@ public sealed class HuggingFaceMelSource(
                 {
                     yield return sample;
                     sourceCount++;
+                    globalIndex++;
 
                     if (sourceCount % 1000 == 0)
                         log.LogInformation("    {Source}: {Count} samples processed ({Total} total)",
@@ -100,8 +105,9 @@ public sealed class HuggingFaceMelSource(
 
     private MelSample[] ReadParquetFile(
         string path, string audioCol, string textCol,
-        int? remaining, ref int globalIndex)
+        int? remaining, int startIndex)
     {
+        int globalIndex = startIndex;
         using var reader = new ParquetFileReader(path);
         var samples = new List<MelSample>();
 
@@ -130,6 +136,33 @@ public sealed class HuggingFaceMelSource(
             // Read audio bytes column (struct with "bytes" field)
             var audioBytes = ReadAudioBytesColumn(rowGroup, audioColIdx, numRows);
 
+            // Collect decoded audio + metadata in batches for GPU mel processing
+            var pending = new List<(float[] Pcm, string Text, int[] TokenIds)>();
+
+            void FlushBatch()
+            {
+                if (pending.Count == 0) return;
+
+                var pcmBatch = pending.Select(p => p.Pcm).ToArray();
+                var melResults = _mel.ComputeBatch(pcmBatch);
+
+                for (int b = 0; b < pending.Count; b++)
+                {
+                    var (values, frames) = melResults[b];
+                    if (values is null || frames <= 0) continue;
+
+                    string sampleId = $"{globalIndex:D8}";
+                    samples.Add(new MelSample(
+                        Id: sampleId,
+                        MelBins: _mel.MelBins,
+                        Frames: frames,
+                        Values: values,
+                        TokenIds: pending[b].TokenIds));
+                    globalIndex++;
+                }
+                pending.Clear();
+            }
+
             for (int row = 0; row < numRows; row++)
             {
                 if (remaining.HasValue && samples.Count >= remaining.Value)
@@ -153,24 +186,20 @@ public sealed class HuggingFaceMelSource(
                 }
                 catch
                 {
-                    continue; // Skip undecodable audio
+                    continue;
                 }
 
                 if (pcm is null || pcm.Length < MinAudioSamples || pcm.Length > MaxAudioSamples)
                     continue;
 
-                var (values, frames) = _mel.Compute(pcm);
+                pending.Add((pcm, normalized, tokenIds));
 
-                string sampleId = $"{globalIndex:D8}";
-                samples.Add(new MelSample(
-                    Id: sampleId,
-                    MelBins: _mel.MelBins,
-                    Frames: frames,
-                    Values: values,
-                    TokenIds: tokenIds));
-
-                globalIndex++;
+                if (pending.Count >= BatchSize)
+                    FlushBatch();
             }
+
+            // Flush remaining partial batch
+            FlushBatch();
         }
 
         return samples.ToArray();
