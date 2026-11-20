@@ -205,36 +205,45 @@ public sealed class HuggingFaceMelSource : IMelSource
                 int batchEnd = Math.Min(batch + BatchSize, validRows.Count);
                 var batchSlice = validRows.GetRange(batch, batchEnd - batch);
 
-                // Decode all clips in this batch concurrently
-                var decodeTasks = batchSlice.Select(r => Task.Run(() => DecodeAudio(r.Audio))).ToArray();
-                float[]?[] pcmResults;
+                // Decode FLAC + compute mel in parallel across all cores
+                var processTasks = batchSlice.Select((r, idx) => Task.Run(() =>
+                {
+                    var pcm = DecodeAudio(r.Audio);
+                    if (pcm is null || pcm.Length < MinAudioSamples || pcm.Length > MaxAudioSamples)
+                        return ((float[]?, int, int))default;
+
+                    // Each task gets its own MelTransform (they're cheap, avoid contention)
+                    var mel = new MelTransform();
+                    var (values, frames) = mel.Compute(pcm);
+                    return (values, frames, idx);
+                })).ToArray();
+
+                (float[]? Values, int Frames, int Idx)[] results;
                 try
                 {
-                    pcmResults = await Task.WhenAll(decodeTasks);
+                    results = await Task.WhenAll(processTasks);
                 }
                 catch
                 {
-                    // If WhenAll throws, collect individual results
-                    pcmResults = new float[]?[decodeTasks.Length];
-                    for (int i = 0; i < decodeTasks.Length; i++)
+                    results = new (float[]?, int, int)[processTasks.Length];
+                    for (int i = 0; i < processTasks.Length; i++)
                     {
-                        try { pcmResults[i] = await decodeTasks[i]; }
-                        catch { pcmResults[i] = null; }
+                        try { results[i] = await processTasks[i]; }
+                        catch { results[i] = default; }
                     }
                 }
 
+                // Collect results in order
                 for (int i = 0; i < batchSlice.Count; i++)
                 {
-                    var pcm = pcmResults[i];
-                    if (pcm is null || pcm.Length < MinAudioSamples || pcm.Length > MaxAudioSamples)
+                    var (values, frames, _) = results[i];
+                    if (values is null || frames <= 0)
                     {
                         skipped++;
                         continue;
                     }
 
                     decoded++;
-                    var (values, frames) = _mel.Compute(pcm);
-
                     string sampleId = $"{globalIndex:D8}";
                     samples.Add(new MelSample(
                         Id: sampleId,
