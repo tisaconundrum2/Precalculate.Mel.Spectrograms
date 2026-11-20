@@ -218,12 +218,14 @@ public sealed class HuggingFaceMelSource(
         return pcmFloat;
     }
 
-    private static List<string> FindParquetFiles(MountOptions mounts, RecipeSource source)
+    private List<string> FindParquetFiles(MountOptions mounts, RecipeSource source)
     {
-        // HF datasets are mounted at basePath/org/repo
-        // Parquet files are under: {mount}/{config}/{split}/*.parquet
-        // or directly: {mount}/{split}/*.parquet
-        // or: {mount}/data/{split}-*.parquet
+        // HF datasets mount the full repo at basePath/org/repo.
+        // Parquet layout varies by dataset:
+        //   Pattern A: {config}/{split}/0000.parquet        (LibriSpeech "all")
+        //   Pattern B: {config}/{split}-00000-of-00030.parquet (VoxPopuli, People's Speech)
+        //   Pattern C: {split}/0000.parquet                 (no config)
+        //   Pattern D: data/{split}-*.parquet               (some datasets)
 
         string mountPath = mounts.ResolvePath(new DatasetMount
         {
@@ -231,46 +233,71 @@ public sealed class HuggingFaceMelSource(
             RepoId = source.Name,
         });
 
-        var searchPaths = new List<string>();
+        // Log what we can see at the mount for debugging
+        if (Directory.Exists(mountPath))
+        {
+            var topLevel = Directory.GetDirectories(mountPath)
+                .Select(Path.GetFileName)
+                .Take(10);
+            log.LogInformation("  Mount {Path} contains dirs: [{Dirs}]",
+                mountPath, string.Join(", ", topLevel));
+        }
+        else
+        {
+            log.LogWarning("  Mount path does not exist: {Path}", mountPath);
+            return [];
+        }
 
-        // Try: mount/config/split/
+        var searchPaths = new List<(string Dir, bool IsSplitDir)>();
+
+        // Pattern A: mount/config/split/ (files named 0000.parquet)
         if (source.Config is not null)
-            searchPaths.Add(Path.Combine(mountPath, source.Config, source.Split));
+        {
+            searchPaths.Add((Path.Combine(mountPath, source.Config, source.Split), true));
+            // Pattern B: mount/config/ (files named {split}-00000-of-*.parquet)
+            searchPaths.Add((Path.Combine(mountPath, source.Config), false));
+        }
 
-        // Try: mount/split/
-        searchPaths.Add(Path.Combine(mountPath, source.Split));
+        // Pattern C: mount/split/
+        searchPaths.Add((Path.Combine(mountPath, source.Split), true));
 
-        // Try: mount/data/ with split prefix
-        searchPaths.Add(Path.Combine(mountPath, "data"));
+        // Pattern D: mount/data/ with split prefix
+        searchPaths.Add((Path.Combine(mountPath, "data"), false));
 
-        // Try: mount/ directly
-        searchPaths.Add(mountPath);
+        // Fallback: mount/ directly
+        searchPaths.Add((mountPath, false));
+
+        // Normalize split name for filename matching: "train.clean.100" → "train.clean.100" and "train-clean-100"
+        string splitDot = source.Split;
+        string splitDash = source.Split.Replace(".", "-");
 
         var files = new List<string>();
-        foreach (var dir in searchPaths)
+        foreach (var (dir, isSplitDir) in searchPaths)
         {
             if (!Directory.Exists(dir))
                 continue;
 
-            // Match split-specific files: {split}-00000-of-00005.parquet
             var candidates = Directory.GetFiles(dir, "*.parquet")
                 .Where(f =>
                 {
-                    string name = Path.GetFileName(f);
-                    // Accept any parquet file in a split-specific directory
-                    if (dir.EndsWith(source.Split, StringComparison.OrdinalIgnoreCase))
+                    // In a split-specific directory, accept all parquet files
+                    if (isSplitDir)
                         return true;
-                    // Or files whose name starts with the split
-                    return name.StartsWith(source.Split.Replace(".", "-"),
-                        StringComparison.OrdinalIgnoreCase);
+
+                    string name = Path.GetFileName(f);
+                    // Match: {split}-00000-of-00030.parquet or {split}.parquet or 0000.parquet
+                    return name.StartsWith(splitDash, StringComparison.OrdinalIgnoreCase)
+                        || name.StartsWith(splitDot, StringComparison.OrdinalIgnoreCase);
                 })
                 .OrderBy(f => f)
                 .ToList();
 
             if (candidates.Count > 0)
             {
+                log.LogInformation("  Found {Count} parquet files in {Dir}",
+                    candidates.Count, dir);
                 files.AddRange(candidates);
-                break; // Use first match
+                break;
             }
         }
 
