@@ -141,7 +141,8 @@ public sealed class HuggingFaceMelSource : IMelSource
         int globalIndex = startIndex;
         using var reader = new ParquetFileReader(path);
         var samples = new List<MelSample>();
-        int decoded = 0, skipped = 0;
+        int decoded = 0, skipped = 0, totalRowsSoFar = 0;
+        long totalRowsInFile = reader.FileMetaData.NumRows;
         var fileStart = System.Diagnostics.Stopwatch.StartNew();
 
         for (int rg = 0; rg < reader.FileMetaData.NumRowGroups; rg++)
@@ -246,21 +247,23 @@ public sealed class HuggingFaceMelSource : IMelSource
                 if (pending.Count >= BatchSize)
                     FlushBatch();
 
-                // Progress every 100 rows
-                if ((row + 1) % 100 == 0)
+                // Progress every 500 rows (across all row groups)
+                int currentRow = totalRowsSoFar + row + 1;
+                if (currentRow % 500 == 0)
                 {
-                    double pct = 100.0 * (row + 1) / numRows;
+                    double pct = 100.0 * currentRow / totalRowsInFile;
                     double elapsed = fileStart.Elapsed.TotalSeconds;
                     double rate = decoded / Math.Max(elapsed, 0.1);
                     _log.LogInformation("    {File}: row {Row}/{Total} ({Pct:F0}%), " +
                         "{Decoded} decoded, {Skipped} skipped, {Rate:F0} samples/s",
-                        Path.GetFileName(path), row + 1, numRows, pct,
+                        Path.GetFileName(path), currentRow, totalRowsInFile, pct,
                         decoded, skipped, rate);
                 }
             }
 
             // Flush remaining partial batch
             FlushBatch();
+            totalRowsSoFar += numRows;
         }
 
         fileStart.Stop();
