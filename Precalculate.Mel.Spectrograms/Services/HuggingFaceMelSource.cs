@@ -278,29 +278,116 @@ public sealed class HuggingFaceMelSource : IMelSource
     }
 
     /// <summary>
-    /// Decode FLAC audio bytes to 16kHz mono float32 PCM using the managed FlacDecoder.
-    /// No external process spawning — pure C#, ~8x faster than ffmpeg.
+    /// Decode audio bytes (FLAC or WAV) to 16kHz mono float32 PCM.
+    /// Auto-detects format from magic bytes.
     /// </summary>
     [ThreadStatic] private static FlacDecoder.FlacStreamDecoder? _flacDecoder;
 
     private static float[]? DecodeAudio(byte[] audioBytes)
     {
-        _flacDecoder ??= new FlacDecoder.FlacStreamDecoder();
+        if (audioBytes.Length < 4) return null;
 
         try
         {
-            float[] pcm = _flacDecoder.DecodeToFloat32Mono(audioBytes);
+            // Detect format from magic bytes
+            if (audioBytes[0] == (byte)'f' && audioBytes[1] == (byte)'L' &&
+                audioBytes[2] == (byte)'a' && audioBytes[3] == (byte)'C')
+            {
+                // FLAC
+                _flacDecoder ??= new FlacDecoder.FlacStreamDecoder();
+                float[] pcm = _flacDecoder.DecodeToFloat32Mono(audioBytes);
+                if (_flacDecoder.SampleRate != TargetSampleRate)
+                    pcm = Resample(pcm, _flacDecoder.SampleRate, TargetSampleRate);
+                return pcm;
+            }
 
-            // Resample if not 16kHz
-            if (_flacDecoder.SampleRate != TargetSampleRate)
-                pcm = Resample(pcm, _flacDecoder.SampleRate, TargetSampleRate);
+            if (audioBytes[0] == (byte)'R' && audioBytes[1] == (byte)'I' &&
+                audioBytes[2] == (byte)'F' && audioBytes[3] == (byte)'F')
+            {
+                // WAV — parse header and extract PCM
+                return DecodeWav(audioBytes);
+            }
 
-            return pcm;
+            return null; // Unknown format
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Decode a WAV file to mono float32 PCM. Handles pcm_f32le, pcm_s16le, pcm_s24le, pcm_s32le.
+    /// </summary>
+    private static float[]? DecodeWav(byte[] wav)
+    {
+        if (wav.Length < 44) return null;
+
+        // Find "fmt " chunk
+        int pos = 12; // Skip RIFF header
+        int fmtPos = -1, dataPos = -1, dataSize = 0;
+        ushort audioFormat = 0, numChannels = 0;
+        int sampleRate = 0;
+        ushort bitsPerSample = 0;
+
+        while (pos + 8 <= wav.Length)
+        {
+            string chunkId = System.Text.Encoding.ASCII.GetString(wav, pos, 4);
+            int chunkSize = BitConverter.ToInt32(wav, pos + 4);
+
+            if (chunkId == "fmt ")
+            {
+                fmtPos = pos + 8;
+                audioFormat = BitConverter.ToUInt16(wav, fmtPos);
+                numChannels = BitConverter.ToUInt16(wav, fmtPos + 2);
+                sampleRate = BitConverter.ToInt32(wav, fmtPos + 4);
+                bitsPerSample = BitConverter.ToUInt16(wav, fmtPos + 14);
+            }
+            else if (chunkId == "data")
+            {
+                dataPos = pos + 8;
+                dataSize = chunkSize;
+                break;
+            }
+
+            pos += 8 + chunkSize;
+            if (chunkSize % 2 != 0) pos++; // Padding byte
+        }
+
+        if (fmtPos < 0 || dataPos < 0 || dataSize == 0) return null;
+
+        int bytesPerSample = bitsPerSample / 8;
+        int totalSamples = dataSize / bytesPerSample / numChannels;
+        var result = new float[totalSamples];
+
+        for (int i = 0; i < totalSamples; i++)
+        {
+            float sum = 0;
+            for (int ch = 0; ch < numChannels; ch++)
+            {
+                int offset = dataPos + (i * numChannels + ch) * bytesPerSample;
+                if (offset + bytesPerSample > wav.Length) break;
+
+                float val = (audioFormat, bitsPerSample) switch
+                {
+                    (3, 32) => BitConverter.ToSingle(wav, offset),          // pcm_f32le (VoxPopuli, AMI)
+                    (1, 16) => BitConverter.ToInt16(wav, offset) / 32768f,  // pcm_s16le
+                    (1, 32) => BitConverter.ToInt32(wav, offset) / 2147483648f,
+                    (1, 24) => ((wav[offset] | (wav[offset + 1] << 8) | (wav[offset + 2] << 16))
+                               - (wav[offset + 2] >= 128 ? 16777216 : 0)) / 8388608f,
+                    (1, 8) => (wav[offset] - 128) / 128f,
+                    _ => 0f
+                };
+                sum += val;
+            }
+            result[i] = sum / numChannels;
+        }
+
+        // Resample if needed
+        if (sampleRate != TargetSampleRate)
+            result = Resample(result, sampleRate, TargetSampleRate);
+
+        return result;
     }
 
     private static float[] Resample(float[] input, int fromRate, int toRate)
