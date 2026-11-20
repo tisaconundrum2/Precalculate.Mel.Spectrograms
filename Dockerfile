@@ -19,18 +19,16 @@ WORKDIR /app
 COPY --from=mcr.microsoft.com/dotnet/runtime:10.0 /usr/share/dotnet /usr/share/dotnet
 RUN ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
 
-# Install ffmpeg + tools for libtorch download
+# Install ffmpeg + python3 for PyTorch (libtorch sidecar)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libicu70 libgomp1 wget unzip \
+    ffmpeg libicu70 libgomp1 python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install libtorch C++ distribution (TorchSharp native backend)
-RUN wget -q "https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.5.1%2Bcu121.zip" \
-    -O /tmp/libtorch.zip \
-    && unzip -q /tmp/libtorch.zip -d /opt \
-    && rm /tmp/libtorch.zip
+# Install PyTorch with CUDA 12.1 — TorchSharp binds to its native libs
+RUN pip3 install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 
-ENV LD_LIBRARY_PATH=/opt/libtorch/lib:$LD_LIBRARY_PATH
+# Point linker at PyTorch's native libs so TorchSharp finds libtorch
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH
 
 # HF Jobs mount datasets at /data; spool is ephemeral
 RUN mkdir -p /tmp/mel-spool /data
