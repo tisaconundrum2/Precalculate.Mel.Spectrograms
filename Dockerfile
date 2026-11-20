@@ -3,7 +3,8 @@ WORKDIR /src
 
 COPY Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.csproj \
      Precalculate.Mel.Spectrograms/
-RUN dotnet restore Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.csproj
+RUN dotnet restore Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.csproj \
+    -r linux-x64
 
 COPY Precalculate.Mel.Spectrograms/ Precalculate.Mel.Spectrograms/
 RUN dotnet publish Precalculate.Mel.Spectrograms/Precalculate.Mel.Spectrograms.csproj \
